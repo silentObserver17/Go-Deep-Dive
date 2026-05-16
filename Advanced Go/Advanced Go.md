@@ -678,15 +678,15 @@ srv := NewServer(opts...)
 
 ### Summary
 
-|Topic|Core Idea|
-|---|---|
-|Context|Cancellation tree. Pass as first arg. Use unexported key types for values. Always defer cancel().|
-|Reflection|Runtime type/value inspection. Slow. Use for frameworks/serializers. Prefer generics for new code.|
-|Unsafe|Raw memory access. `unsafe.Pointer` bridges types. Never store `uintptr` as a variable.|
-|Custom errors|Implement `error`. Add `Unwrap()` for chain. Return `error` interface, never concrete nil.|
-|Wrapping|`%w` wraps. `errors.Is` checks identity. `errors.As` extracts type. Always add context on wrap.|
-|Panic/Recover|Panic for programming errors. Recover in HTTP middleware and goroutine supervisors. Convert to error at API boundaries.|
-|Functional options|`type Option func(*T)`. Defaults in constructor. Apply with a loop. Backwards-compatible and composable.|
+| Topic              | Core Idea                                                                                                               |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| Context            | Cancellation tree. Pass as first arg. Use unexported key types for values. Always defer cancel().                       |
+| Reflection         | Runtime type/value inspection. Slow. Use for frameworks/serializers. Prefer generics for new code.                      |
+| Unsafe             | Raw memory access. `unsafe.Pointer` bridges types. Never store `uintptr` as a variable.                                 |
+| Custom errors      | Implement `error`. Add `Unwrap()` for chain. Return `error` interface, never concrete nil.                              |
+| Wrapping           | `%w` wraps. `errors.Is` checks identity. `errors.As` extracts type. Always add context on wrap.                         |
+| Panic/Recover      | Panic for programming errors. Recover in HTTP middleware and goroutine supervisors. Convert to error at API boundaries. |
+| Functional options | `type Option func(*T)`. Defaults in constructor. Apply with a loop. Backwards-compatible and composable.                |
 
 | Concept            | Problem Solved         |
 | ------------------ | ---------------------- |
@@ -697,3 +697,486 @@ srv := NewServer(opts...)
 | Error wrapping     | debugging & tracing    |
 | Panic/recover      | crash handling         |
 | Functional options | clean API design       |
+
+# Closures & Higher-Order Functions in Go — Deep Dive
+---
+### 1. What Is a Closure?
+A **closure** is a function value that _captures_ variables from its surrounding lexical scope — it "closes over" those variables. The function and the captured environment together form the closure.
+
+In Go, any anonymous function (`func() { ... }`) that references variables declared outside its own body is a closure.
+
+```go
+func makeCounter() func() int {
+    count := 0                  // declared in outer scope
+    return func() int {
+        count++                 // captures `count` — this is the closure
+        return count
+    }
+}
+
+func main() {
+    c := makeCounter()
+    fmt.Println(c()) // 1
+    fmt.Println(c()) // 2
+    fmt.Println(c()) // 3
+}
+```
+
+**What's happening under the hood:**
+
+- `count` is a local variable of `makeCounter`.
+- Normally it would be stack-allocated and destroyed when `makeCounter` returns.
+- But because the returned function _references_ it, the Go compiler performs **escape analysis** and promotes `count` to the heap.
+- The returned function holds a pointer to that heap-allocated `count`.
+- Every call to `c()` increments the _same_ `count` in memory.
+
+## 2. Closures Capture by Reference, Not by Value
+
+This is the single most important thing to understand — and the source of the most common Go bug.
+```go
+funcs := make([]func(), 3)
+for i := 0; i < 3; i++ {
+    funcs[i] = func() {
+        fmt.Println(i) // captures the variable `i`, not its current value
+    }
+}
+funcs[0]() // 3  ← NOT 0!
+funcs[1]() // 3  ← NOT 1!
+funcs[2]() // 3  ← NOT 2!
+```
+
+> **Note:** This behaviour is fixed in Go version 1.22+
+
+By the time any of these functions run, the loop has finished and `i == 3`. All three closures share the _same_ `i` variable.
+
+**Fix 1 — Shadow the variable inside the loop:**
+```go
+for i := 0; i < 3; i++ {
+    i := i // new `i` scoped to this iteration
+    funcs[i] = func() { fmt.Println(i) }
+}
+// Output: 0, 1, 2 ✓
+```
+
+**Fix 2 — Pass as a parameter:**
+```go
+for i := 0; i < 3; i++ {
+    funcs[i] = func(n int) func() {
+        return func() { fmt.Println(n) }
+    }(i)
+}
+// Output: 0, 1, 2 ✓
+```
+
+## 3. Multiple Closures, Shared State
+
+Two closures returned from the same scope share the same captured variables.
+```go
+func makeAccount(balance float64) (deposit, withdraw func(float64) float64) {
+    deposit = func(amount float64) float64 {
+        balance += amount
+        return balance
+    }
+    withdraw = func(amount float64) float64 {
+        balance -= amount
+        return balance
+    }
+    return
+}
+
+func main() {
+    dep, with := makeAccount(100)
+    fmt.Println(dep(50))   // 150
+    fmt.Println(with(30))  // 120  — same `balance`
+    fmt.Println(dep(10))   // 130
+}
+```
+
+This is a powerful pattern — it gives you **encapsulated mutable state** without a struct. The `balance` variable is completely private to the two closures; no other code can touch it.
+
+## 4. Higher-Order Functions (HOF)
+
+A **higher-order function** is a function that either:
+
+1. Takes one or more functions as arguments, or
+2. Returns a function as its result.
+
+Go supports both naturally since functions are first-class values.
+
+### 4.1 Functions as Arguments
+```go
+func apply(nums []int, fn func(int) int) []int {
+    result := make([]int, len(nums))
+    for i, v := range nums {
+        result[i] = fn(v)
+    }
+    return result
+}
+
+func main() {
+    nums := []int{1, 2, 3, 4, 5}
+
+    doubled := apply(nums, func(n int) int { return n * 2 })
+    fmt.Println(doubled) // [2 4 6 8 10]
+
+    squared := apply(nums, func(n int) int { return n * n })
+    fmt.Println(squared) // [1 4 9 16 25]
+}
+```
+
+### 4.2 The Classic Trio: Map, Filter, Reduce
+
+Go doesn't ship these in the stdlib (before generics), but they're trivial to implement:
+```go
+// Map
+func Map[T, U any](slice []T, fn func(T) U) []U {
+    out := make([]U, len(slice))
+    for i, v := range slice {
+        out[i] = fn(v)
+    }
+    return out
+}
+
+// Filter
+func Filter[T any](slice []T, pred func(T) bool) []T {
+    var out []T
+    for _, v := range slice {
+        if pred(v) {
+            out = append(out, v)
+        }
+    }
+    return out
+}
+
+// Reduce
+func Reduce[T, U any](slice []T, init U, fn func(U, T) U) U {
+    acc := init
+    for _, v := range slice {
+        acc = fn(acc, v)
+    }
+    return acc
+}
+
+// Usage
+nums := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+
+evens   := Filter(nums, func(n int) bool { return n%2 == 0 })
+doubled := Map(evens, func(n int) int { return n * 2 })
+sum     := Reduce(doubled, 0, func(acc, n int) int { return acc + n })
+
+fmt.Println(sum) // (2+4+6+8+10)*2 = 60
+```
+
+## 5. Function Factories
+
+A **function factory** is a HOF that returns a customized function. The returned function is always a closure — it captures the factory's parameters.
+### 5.1 Multiplier Factory
+```go
+func multiplier(factor int) func(int) int {
+    return func(n int) int {
+        return n * factor
+    }
+}
+
+triple := multiplier(3)
+fmt.Println(triple(7))  // 21
+fmt.Println(triple(10)) // 30
+
+double := multiplier(2)
+fmt.Println(double(7))  // 14
+```
+
+### 5.2 Predicate Factory
+```go
+func greaterThan(threshold int) func(int) bool {
+    return func(n int) bool { return n > threshold }
+}
+
+nums := []int{3, 7, 1, 9, 4, 6}
+big  := Filter(nums, greaterThan(5))
+fmt.Println(big) // [7 9 6]
+```
+
+### 5.3 HTTP Handler Factory (realistic)
+```go
+func requireRole(role string, next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        userRole := r.Header.Get("X-Role")
+        if userRole != role {
+            http.Error(w, "Forbidden", http.StatusForbidden)
+            return
+        }
+        next(w, r)
+    }
+}
+
+// Usage
+mux.HandleFunc("/admin", requireRole("admin", adminHandler))
+mux.HandleFunc("/reports", requireRole("finance", reportsHandler))
+```
+
+`requireRole` captures `role` and `next`. Each call to the returned function checks the request against the captured role — clean, reusable middleware.
+
+## 6. Function Composition
+You can compose functions — build complex behavior by chaining simpler ones.
+
+```go
+type StringTransform func(string) string
+
+func compose(fns ...StringTransform) StringTransform {
+    return func(s string) string {
+        for _, fn := range fns {
+            s = fn(s)
+        }
+        return s
+    }
+}
+
+trim    := strings.TrimSpace
+upper   := strings.ToUpper
+exclaim := func(s string) string { return s + "!" }
+
+process := compose(trim, upper, exclaim)
+fmt.Println(process("  hello world  ")) // "HELLO WORLD!"
+```
+
+The `compose` function captures `fns` — a slice of functions. When `process` is called, it iterates over them. This is the **pipeline pattern**, common in middleware chains.
+
+## 7. Memoization
+
+Closures are perfect for memoization — caching the results of expensive calls.
+```go
+func memoize(fn func(int) int) func(int) int {
+    cache := make(map[int]int) // captured by the returned closure
+    return func(n int) int {
+        if v, ok := cache[n]; ok {
+            return v
+        }
+        result := fn(n)
+        cache[n] = result
+        return result
+    }
+}
+
+var fib func(int) int
+fib = memoize(func(n int) int {
+    if n <= 1 {
+        return n
+    }
+    return fib(n-1) + fib(n-2)
+})
+
+fmt.Println(fib(40)) // fast — results cached
+```
+
+The `cache` map lives on the heap, captured by the returned closure. Each distinct memoized function gets its own independent cache.
+
+## 8. Middleware Chaining (Real-World HOF)
+
+This is one of the most common HOF patterns in Go web development.
+
+```go
+type Middleware func(http.Handler) http.Handler
+
+func chain(h http.Handler, middlewares ...Middleware) http.Handler {
+    // Apply in reverse so execution order is left-to-right
+    for i := len(middlewares) - 1; i >= 0; i-- {
+        h = middlewares[i](h)
+    }
+    return h
+}
+
+func logging(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(w, r)
+        log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+    })
+}
+
+func recovery(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if err := recover(); err != nil {
+                http.Error(w, "Internal Server Error", 500)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
+}
+
+// Usage
+handler := chain(myHandler, logging, recovery)
+```
+
+`logging` closes over nothing — it only uses its parameter. `recovery` closes over nothing either. But the _pattern_ is HOF: each middleware takes a handler and returns a handler.
+
+## 9. Closures for Lazy Evaluation
+
+Sometimes you want to defer computation until it's actually needed.
+```go
+type Lazy[T any] func() T
+
+func lazily[T any](fn func() T) Lazy[T] {
+    var (
+        computed bool
+        value    T
+    )
+    return func() T {
+        if !computed {
+            value = fn()
+            computed = true
+        }
+        return value
+    }
+}
+
+// Expensive DB call only runs on first access
+expensiveConfig := lazily(func() Config {
+    return loadConfigFromDB()
+})
+
+// Somewhere later:
+cfg := expensiveConfig() // computed once
+cfg2 := expensiveConfig() // returned from cache
+```
+
+The closure captures `computed` and `value` — two variables that live as long as the `Lazy` function itself does.
+
+## 10. Closures in Goroutines — The Trap
+
+Closures and goroutines interact in a particularly dangerous way.
+
+```go
+// WRONG — classic goroutine closure bug
+for _, item := range items {
+    go func() {
+        process(item) // captures loop variable — data race / wrong value
+    }()
+}
+
+// CORRECT — pass as argument
+for _, item := range items {
+    go func(it Item) {
+        process(it)
+    }(item)
+}
+
+// ALSO CORRECT — shadow variable
+for _, item := range items {
+    item := item
+    go func() {
+        process(item)
+    }()
+}
+```
+
+> Again fixed in go version 1.22+
+
+This matters because:
+
+1. The goroutine may not run until after the loop has advanced `item`.
+2. Multiple goroutines sharing the same variable is a **data race** — detectable with `go test -race`.
+
+## 11. Stateful Iterators
+
+Closures can implement iterators without a full struct:
+```go
+func rangeIter(start, end, step int) func() (int, bool) {
+    current := start
+    return func() (int, bool) {
+        if current >= end {
+            return 0, false
+        }
+        v := current
+        current += step
+        return v, true
+    }
+}
+
+iter := rangeIter(0, 10, 2)
+for {
+    v, ok := iter()
+    if !ok {
+        break
+    }
+    fmt.Println(v) // 0 2 4 6 8
+}
+```
+
+The `current` variable is the iterator's private state — no external code can modify it.
+
+## 12. Functional Options Pattern
+
+we already discussed above.
+
+## 13. sync.Once as a Closure Pattern
+
+`sync.Once` is built on a similar idea — do something exactly once, no matter how many goroutines try:
+
+```go
+func onceDo() func() {
+    var once sync.Once
+    return func() {
+        once.Do(func() {
+            fmt.Println("initializing...")
+            // expensive setup
+        })
+    }
+}
+
+init := onceDo()
+go init() // runs setup
+go init() // no-op
+go init() // no-op
+```
+
+The `once` variable is captured by the returned closure. Safe for concurrent use — `sync.Once` handles the synchronization internally.
+
+## 14. Escape Analysis — What Actually Happens to Captured Variables
+
+When a closure captures a variable, the compiler must decide: stack or heap?
+```go
+// go build -gcflags="-m" to see escape analysis output
+
+func noEscape() func() int {
+    x := 42
+    // If x is captured and the closure escapes the function,
+    // x must be heap-allocated
+    return func() int { return x }
+    // → compiler: "x escapes to heap"
+}
+```
+
+Key rules:
+
+- If the closure itself doesn't escape (never stored, never returned, never passed elsewhere), the variable _may_ stay on the stack.
+- If the closure escapes (returned, stored in a map, passed to a goroutine), captured variables escape to the heap.
+- This is automatic — you don't manage it. But knowing this helps you understand **why closures can cause GC pressure** at high call rates.
+
+Use `go build -gcflags="-m" ./...` to see what escapes.
+```bash
+./closures.go:17:6: can inline noEscape
+./closures.go:21:12: can inline noEscape.func1
+./closures.go:25:6: can inline main
+./closures.go:39:11: inlining call to noEscape
+./closures.go:21:12: func literal escapes to heap
+./closures.go:39:11: func literal does not escape
+
+```
+
+## 15. Summary — Mental Model
+
+|Concept|Key Point|
+|---|---|
+|Closure|A function + its captured environment (variables by reference)|
+|Capture semantics|By **reference** (pointer to variable), not by value|
+|Loop variable bug|All closures in a loop share the _same_ variable — shadow it or pass as argument|
+|HOF|A function that takes or returns a function|
+|Factory|HOF that returns a closure capturing its parameters|
+|Composition|Chain functions together; each gets the output of the previous|
+|Memoization|Closure captures a `map` as a private cache|
+|Middleware|HOF pattern: `func(Handler) Handler` — wraps behavior|
+|Functional Options|Each option is a closure that mutates a config struct|
+|Goroutine + closure|Always pass loop variables as arguments — never close over them|
+|Heap escape|Captured variables escape to the heap when the closure itself escapes|
